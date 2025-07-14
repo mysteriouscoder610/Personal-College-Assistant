@@ -38,8 +38,12 @@ def load_file_for_summary(uploaded_file):
 
 def summarize_document(documents, summary_type):
     """Summarize document using the specified type."""
-    # Get API key from session state
-    google_api_key = st.session_state.google_api_key
+    # Get API key from session state or directly from environment
+    try:
+        google_api_key = st.session_state.google_api_key
+    except (KeyError, AttributeError):
+        # Fallback to environment variable if not in session state
+        google_api_key = os.getenv("GOOGLE_API_KEY")
     
     model = ChatGoogleGenerativeAI(
         model="gemini-1.5-flash",

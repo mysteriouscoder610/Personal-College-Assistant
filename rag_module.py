@@ -46,8 +46,12 @@ def create_vector_store(documents):
     )
     chunks = text_splitter.split_documents(documents)
     
-    # Get API key from session state
-    google_api_key = st.session_state.google_api_key
+    # Get API key from session state or directly from environment
+    try:
+        google_api_key = st.session_state.google_api_key
+    except (KeyError, AttributeError):
+        # Fallback to environment variable if not in session state
+        google_api_key = os.getenv("GOOGLE_API_KEY")
     
     embeddings = GoogleGenerativeAIEmbeddings(
         model="models/embedding-001",
@@ -62,8 +66,12 @@ def query_document(vector_store, question):
     relevant_docs = vector_store.similarity_search(question, k=3)
     context = "\n\n".join([doc.page_content for doc in relevant_docs])
     
-    # Get API key from session state
-    google_api_key = st.session_state.google_api_key
+    # Get API key from session state or directly from environment
+    try:
+        google_api_key = st.session_state.google_api_key
+    except (KeyError, AttributeError):
+        # Fallback to environment variable if not in session state
+        google_api_key = os.getenv("GOOGLE_API_KEY")
     
     model = ChatGoogleGenerativeAI(
         model="gemini-1.5-flash",
