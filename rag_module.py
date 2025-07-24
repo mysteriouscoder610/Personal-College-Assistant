@@ -11,26 +11,42 @@ import asyncio
 import threading
 from functools import wraps
 
-# Fix for asyncio event loop issues in Streamlit
-def fix_asyncio_loop():
-    """Fix asyncio event loop issues in Streamlit"""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            raise RuntimeError("Event loop is closed")
-    except RuntimeError:
-        # Create new event loop for this thread
+# Fix for asyncio event loop issues - improved approach
+def run_async_in_thread(async_func, *args, **kwargs):
+    """Run async function in a separate thread to avoid event loop conflicts."""
+    import concurrent.futures
+    import asyncio
+    
+    def run_in_thread():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-    return loop
+        try:
+            return loop.run_until_complete(async_func(*args, **kwargs))
+        finally:
+            loop.close()
+    
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future = executor.submit(run_in_thread)
+        return future.result()
 
-# Apply the fix at module level
-try:
-    import nest_asyncio
-    nest_asyncio.apply()
-except ImportError:
-    st.warning("nest_asyncio not installed. Some features may not work properly.")
-    pass
+def get_api_key():
+    """Get Google API key from various sources with proper error handling."""
+    api_key = None
+    
+    # Try session state first
+    if hasattr(st.session_state, 'google_api_key') and st.session_state.google_api_key:
+        api_key = st.session_state.google_api_key
+    # Try Streamlit secrets
+    elif hasattr(st, 'secrets') and 'GOOGLE_API_KEY' in st.secrets:
+        api_key = st.secrets["GOOGLE_API_KEY"]
+    # Try environment variable
+    elif os.getenv("GOOGLE_API_KEY"):
+        api_key = os.getenv("GOOGLE_API_KEY")
+    
+    if not api_key or api_key == "your_gemini_api_key_here":
+        return None
+    
+    return api_key
 
 def load_file_for_rag(uploaded_file):
     """Load document from uploaded file for RAG."""
@@ -63,121 +79,147 @@ def load_file_for_rag(uploaded_file):
         return None
 
 def create_vector_store(documents):
-    """Create FAISS vector store from documents."""
+    """Create FAISS vector store from documents with improved error handling."""
     try:
-        # Fix asyncio event loop before creating embeddings
-        fix_asyncio_loop()
-        
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200
-        )
-        chunks = text_splitter.split_documents(documents)
-        
-        # Get API key with better error handling
-        google_api_key = None
-        
-        # Try to get from session state first
-        if hasattr(st.session_state, 'google_api_key') and st.session_state.google_api_key:
-            google_api_key = st.session_state.google_api_key
-        # Fallback to environment variable
-        elif os.getenv("GOOGLE_API_KEY"):
-            google_api_key = os.getenv("GOOGLE_API_KEY")
-        # Try Streamlit secrets
-        elif hasattr(st, 'secrets') and 'GOOGLE_API_KEY' in st.secrets:
-            google_api_key = st.secrets["GOOGLE_API_KEY"]
-        
+        # Get API key
+        google_api_key = get_api_key()
         if not google_api_key:
             st.error("❌ Google API Key not found. Please set it in your environment variables or Streamlit secrets.")
             st.info("You can get an API key from: https://makersuite.google.com/app/apikey")
             return None
         
-        # Create embeddings with proper error handling
-        embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001",
-            google_api_key=google_api_key
+        # Split documents into chunks
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len,
+            separators=["\n\n", "\n", " ", ""]
         )
+        chunks = text_splitter.split_documents(documents)
         
-        # Create vector store
-        vector_store = FAISS.from_documents(chunks, embeddings)
-        return vector_store
+        if not chunks:
+            st.error("❌ No text chunks were created from the document.")
+            return None
+        
+        st.info(f"📄 Created {len(chunks)} text chunks for processing")
+        
+        # Create embeddings - synchronous approach
+        try:
+            embeddings = GoogleGenerativeAIEmbeddings(
+                model="models/embedding-001",
+                google_api_key=google_api_key
+            )
+            
+            # Create vector store with progress tracking
+            with st.spinner("Creating embeddings... This may take a moment..."):
+                vector_store = FAISS.from_documents(chunks, embeddings)
+                
+            return vector_store
+            
+        except Exception as embed_error:
+            error_msg = str(embed_error).lower()
+            st.error(f"❌ Error creating embeddings: {str(embed_error)}")
+            
+            # Provide specific error guidance
+            if "quota" in error_msg or "limit" in error_msg:
+                st.info("💡 **API Quota Issue**: You may have exceeded your API quota. Check your Google Cloud console.")
+            elif "authentication" in error_msg or "api key" in error_msg:
+                st.info("💡 **Authentication Issue**: Please verify your Google API key is correct and active.")
+            elif "timeout" in error_msg:
+                st.info("💡 **Timeout Issue**: Try with a smaller document or check your internet connection.")
+            else:
+                st.info("💡 **General Issue**: Try refreshing the page and uploading the document again.")
+            
+            return None
         
     except Exception as e:
         st.error(f"❌ Error creating vector store: {str(e)}")
-        
-        # Provide helpful suggestions based on error type
-        error_msg = str(e).lower()
-        if "event loop" in error_msg or "asyncio" in error_msg:
-            st.info("💡 **Solution**: This appears to be an asyncio event loop issue. Try:")
-            st.code("pip install nest-asyncio", language="bash")
-            st.write("Or consider using OpenAI embeddings as an alternative.")
-        elif "api" in error_msg or "key" in error_msg:
-            st.info("💡 **Solution**: Check your Google API key configuration.")
-        elif "quota" in error_msg or "limit" in error_msg:
-            st.info("💡 **Solution**: You may have exceeded your API quota. Check your Google Cloud console.")
-            
         return None
 
 def query_document(vector_store, question):
-    """Query the document with a question."""
+    """Query the document with a question - improved version."""
     try:
-        # Fix asyncio event loop before querying
-        fix_asyncio_loop()
+        if not vector_store:
+            return "❌ Vector store is not available. Please upload and process a document first."
         
-        relevant_docs = vector_store.similarity_search(question, k=3)
-        context = "\n\n".join([doc.page_content for doc in relevant_docs])
-        
-        # Get API key with better error handling
-        google_api_key = None
-        
-        if hasattr(st.session_state, 'google_api_key') and st.session_state.google_api_key:
-            google_api_key = st.session_state.google_api_key
-        elif os.getenv("GOOGLE_API_KEY"):
-            google_api_key = os.getenv("GOOGLE_API_KEY")
-        elif hasattr(st, 'secrets') and 'GOOGLE_API_KEY' in st.secrets:
-            google_api_key = st.secrets["GOOGLE_API_KEY"]
-        
+        # Get API key
+        google_api_key = get_api_key()
         if not google_api_key:
             return "❌ Google API Key not found. Please configure your API key."
         
-        model = ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash",
-            google_api_key=google_api_key,
-            temperature=0.1
-        )
+        # Search for relevant documents
+        try:
+            relevant_docs = vector_store.similarity_search(question, k=3)
+            if not relevant_docs:
+                return "❌ No relevant content found in the document for your question."
+        except Exception as search_error:
+            st.error(f"Search error: {str(search_error)}")
+            return "❌ Error occurred while searching the document."
         
+        # Combine context
+        context = "\n\n".join([doc.page_content for doc in relevant_docs])
+        
+        if not context.strip():
+            return "❌ No relevant content found to answer your question."
+        
+        # Create model
+        try:
+            model = ChatGoogleGenerativeAI(
+                model="gemini-1.5-flash",
+                google_api_key=google_api_key,
+                temperature=0.1,
+                max_output_tokens=1024
+            )
+        except Exception as model_error:
+            st.error(f"Model creation error: {str(model_error)}")
+            return "❌ Error creating the AI model."
+        
+        # Create prompt
         prompt = PromptTemplate(
-            template="""Answer the question based on the following context. If the answer cannot be found in the context, say "I cannot find the answer in the document."
+            template="""You are a helpful assistant that answers questions based on the provided context.
 
-Context:
+Context from the document:
 {context}
 
 Question: {question}
+
+Instructions:
+- Answer based only on the provided context
+- If the answer cannot be found in the context, say "I cannot find the answer in the provided document."
+- Be concise and accurate
+- If you're not sure, say so
 
 Answer:""",
             input_variables=["context", "question"]
         )
         
-        chain = prompt | model | StrOutputParser()
-        response = chain.invoke({"context": context, "question": question})
-        return response
+        # Create chain and get response
+        try:
+            chain = prompt | model | StrOutputParser()
+            response = chain.invoke({"context": context, "question": question})
+            return response
+        except Exception as chain_error:
+            st.error(f"Chain execution error: {str(chain_error)}")
+            return f"❌ Error processing your question: {str(chain_error)}"
         
     except Exception as e:
-        st.error(f"❌ Error querying document: {str(e)}")
-        return f"Sorry, I encountered an error while processing your question: {str(e)}"
+        st.error(f"❌ Unexpected error in query_document: {str(e)}")
+        return f"❌ Sorry, I encountered an error while processing your question: {str(e)}"
 
 def show_rag_page():
     """Display the RAG query system page."""
     st.header("🔍 RAG Query System")
     st.write("Upload a document and ask questions about it.")
     
-    # Initialize session state variables if they don't exist
+    # Initialize session state variables
     if 'vector_store' not in st.session_state:
         st.session_state.vector_store = None
     if 'documents' not in st.session_state:
         st.session_state.documents = None
+    if 'processed_file' not in st.session_state:
+        st.session_state.processed_file = None
     
-    # API Key input (optional - for users who want to input manually)
+    # API Key configuration
     with st.expander("🔑 API Configuration (Optional)", expanded=False):
         api_key_input = st.text_input(
             "Google API Key (optional - leave empty to use environment variables)",
@@ -187,6 +229,13 @@ def show_rag_page():
         if api_key_input:
             st.session_state.google_api_key = api_key_input
             st.success("✅ API Key set!")
+        
+        # Show current API key status
+        current_key = get_api_key()
+        if current_key:
+            st.success("✅ API Key is configured")
+        else:
+            st.warning("⚠️ No API Key found. Please set one above or in your environment.")
     
     # File upload
     uploaded_file = st.file_uploader(
@@ -198,80 +247,104 @@ def show_rag_page():
     
     if uploaded_file is not None:
         # Show file info
-        st.info(f"📄 **File**: {uploaded_file.name} ({uploaded_file.size} bytes)")
+        file_size_mb = uploaded_file.size / (1024 * 1024)
+        st.info(f"📄 **File**: {uploaded_file.name} ({file_size_mb:.2f} MB)")
         
-        with st.spinner("Loading document..."):
-            documents = load_file_for_rag(uploaded_file)
+        # Check if we need to process this file
+        need_processing = (
+            st.session_state.vector_store is None or 
+            st.session_state.processed_file != uploaded_file.name
+        )
         
-        if documents:
-            st.success(f"✅ Successfully loaded {len(documents)} pages/sections")
+        if need_processing:
+            with st.spinner("Loading document..."):
+                documents = load_file_for_rag(uploaded_file)
             
-            # Create vector store if not already created or if documents changed
-            if (st.session_state.vector_store is None or 
-                st.session_state.documents != documents):
+            if documents:
+                st.success(f"✅ Successfully loaded {len(documents)} pages/sections")
                 
+                # Create vector store
                 with st.spinner("Creating vector store (this may take a moment)..."):
                     vector_store = create_vector_store(documents)
                     
                     if vector_store is not None:
                         st.session_state.vector_store = vector_store
                         st.session_state.documents = documents
-                        st.success("✅ Vector store created successfully!")
+                        st.session_state.processed_file = uploaded_file.name
+                        st.success("✅ Vector store created successfully! You can now ask questions.")
                     else:
                         st.error("❌ Failed to create vector store. Please check the error messages above.")
                         return
-            
-            # Query section
+            else:
+                st.error("❌ Failed to load the document. Please try a different file.")
+                return
+        else:
+            st.success("✅ Document already processed and ready for questions!")
+        
+        # Query section
+        if st.session_state.vector_store is not None:
             st.subheader("💬 Ask Questions")
             
-            # Show some example questions
+            # Example questions
             with st.expander("💡 Example Questions", expanded=False):
                 st.write("""
+                **Try asking:**
                 - What is the main topic of this document?
                 - Can you summarize the key points?
                 - What are the important dates mentioned?
                 - Who are the main people/entities mentioned?
+                - What conclusions does the document reach?
                 """)
             
             question = st.text_input(
                 "Enter your question about the document:",
-                placeholder="What is this document about?"
+                placeholder="What is this document about?",
+                key="question_input"
             )
             
-            col1, col2 = st.columns([1, 1])
+            col1, col2, col3 = st.columns([2, 1, 1])
             
             with col1:
-                if st.button("🔍 Ask Question", type="primary") and question.strip():
-                    if st.session_state.vector_store is not None:
-                        with st.spinner("🔍 Searching for answer..."):
-                            answer = query_document(st.session_state.vector_store, question)
-                        
-                        st.subheader("💡 Answer")
-                        st.write(answer)
-                        
-                        # Add to chat history if you want
-                        if 'chat_history' not in st.session_state:
-                            st.session_state.chat_history = []
-                        
-                        st.session_state.chat_history.append({
-                            'question': question,
-                            'answer': answer
-                        })
-                        
-                    else:
-                        st.error("❌ Vector store not available. Please upload a document first.")
-                
-                elif st.button("🔍 Ask Question", type="primary"):
-                    st.warning("⚠️ Please enter a question.")
+                ask_button = st.button("🔍 Ask Question", type="primary")
             
             with col2:
                 if st.button("🗑️ Clear Document", type="secondary"):
                     st.session_state.vector_store = None
                     st.session_state.documents = None
+                    st.session_state.processed_file = None
                     if 'chat_history' in st.session_state:
                         st.session_state.chat_history = []
-                    st.success("✅ Document cleared! Upload a new document to continue.")
+                    st.success("✅ Document cleared!")
                     st.rerun()
+            
+            with col3:
+                if st.button("🔄 Reset Chat", type="secondary"):
+                    if 'chat_history' in st.session_state:
+                        st.session_state.chat_history = []
+                    st.success("✅ Chat history cleared!")
+            
+            # Process question
+            if ask_button and question.strip():
+                with st.spinner("🔍 Searching for answer..."):
+                    answer = query_document(st.session_state.vector_store, question)
+                
+                st.subheader("💡 Answer")
+                st.write(answer)
+                
+                # Add to chat history
+                if 'chat_history' not in st.session_state:
+                    st.session_state.chat_history = []
+                
+                st.session_state.chat_history.append({
+                    'question': question,
+                    'answer': answer
+                })
+                
+                # Clear the input
+                st.session_state.question_input = ""
+                
+            elif ask_button:
+                st.warning("⚠️ Please enter a question.")
             
             # Show chat history
             if 'chat_history' in st.session_state and st.session_state.chat_history:
@@ -284,21 +357,18 @@ def show_rag_page():
     else:
         st.info("👆 Please upload a document to get started!")
         
-        # Show supported formats
-        st.subheader("📋 Supported File Formats")
-        col1, col2, col3 = st.columns(3)
+        # Show supported formats and tips
+        col1, col2 = st.columns(2)
+        
         with col1:
-            st.write("📄 **PDF Files**")
-            st.write("- Research papers")
-            st.write("- Reports")
-            st.write("- Books")
+            st.subheader("📋 Supported File Formats")
+            st.write("📄 **PDF Files** - Research papers, reports, books")
+            st.write("📝 **Text Files** - Articles, notes, documentation")
+            st.write("📋 **Word Documents** - DOCX and DOC files")
+        
         with col2:
-            st.write("📝 **Text Files**")
-            st.write("- Articles")
-            st.write("- Notes")
-            st.write("- Documentation")
-        with col3:
-            st.write("📋 **Word Documents**")
-            st.write("- DOCX files")
-            st.write("- DOC files")
-            st.write("- Reports")
+            st.subheader("💡 Tips for Best Results")
+            st.write("✅ Use documents with clear, readable text")
+            st.write("✅ Smaller files (< 50MB) process faster")
+            st.write("✅ Ask specific questions for better answers")
+            st.write("✅ Try different phrasings if you don't get good results")
